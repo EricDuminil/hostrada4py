@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import re
+import csv
 
 import numpy as np
 import pandas as pd
@@ -134,6 +135,74 @@ def _read_ida_prn(path: Path) -> pd.DataFrame:
     return frame
 
 
+def _read_tmy3(path: Path) -> pd.DataFrame:
+    """Read a SimStadt/TMY3 file.
+
+    A conventional TMY3 file starts with one metadata record (station id,
+    station name, timezone, latitude, longitude, elevation, ...).  The actual
+    weather-column header follows on the next line.  Some hostrada4py variants
+    omit the metadata record, so this reader detects both layouts.
+    """
+    lines: list[tuple[int, str]] = []
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for line_number, line in enumerate(handle):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            lines.append((line_number, line.rstrip("\r\n")))
+            if len(lines) >= 3:
+                break
+
+    if not lines:
+        return pd.DataFrame()
+
+    def _header_like(line: str) -> bool:
+        lower = line.lower()
+        return (
+            "date" in lower
+            and "time" in lower
+            and any(token in lower for token in ("tas", "temperature", "dry", "hurs", "humidity", "wind", "rsds", "solar"))
+        )
+
+    # Standard TMY3: line 1 = station metadata, line 2 = weather header.
+    # Simpler hostrada4py exports can start directly with the weather header.
+    if len(lines) >= 2 and not _header_like(lines[0][1]) and _header_like(lines[1][1]):
+        header_line_number, header_line = lines[1]
+    else:
+        header_line_number, header_line = lines[0]
+
+    counts = {sep: header_line.count(sep) for sep in (",", ";", "\t")}
+    separator = max(counts, key=counts.get)
+    if counts[separator] == 0:
+        separator = ","
+
+    # Semicolon-separated European exports often use decimal commas; the
+    # standard comma-separated TMY3 representation uses decimal points.
+    decimal = "," if separator == ";" else "."
+
+    frame = pd.read_csv(
+        path,
+        skiprows=header_line_number,
+        sep=separator,
+        decimal=decimal,
+        engine="python",
+        encoding="utf-8-sig",
+    )
+
+    # Defensive cleanup: malformed files can contain a repeated header row.
+    lookup = {str(c).strip().lower(): c for c in frame.columns}
+    date_col = lookup.get("date (mm/dd/yyyy)") or lookup.get("date")
+    time_col = lookup.get("time (hh:mm)") or lookup.get("time")
+    if date_col is not None and time_col is not None and not frame.empty:
+        repeated = (
+            frame[date_col].astype(str).str.strip().str.lower().eq(str(date_col).strip().lower())
+            | frame[time_col].astype(str).str.strip().str.lower().eq(str(time_col).strip().lower())
+        )
+        if repeated.any():
+            frame = frame.loc[~repeated].reset_index(drop=True)
+
+    return _promote_numeric_columns(frame)
+
+
 def read_weather_table(path):
     """Read a generated weather file into a pandas DataFrame."""
     if path is None:
@@ -170,28 +239,136 @@ def read_weather_table(path):
             ),
             errors="coerce",
         )
-        return frame
+        return _promote_numeric_columns(frame)
 
     if suffix == ".prn":
-        return _read_ida_prn(path)
+        return _promote_numeric_columns(_read_ida_prn(path))
+
+    if suffix == ".tmy3":
+        return _read_tmy3(path)
 
     if suffix == ".mos" or _looks_like_modelica_table(path):
-        return _read_modelica_table(path)
+        return _promote_numeric_columns(_read_modelica_table(path))
 
-    # Polysun, SimStadt and ordinary CSV/TSV files.
-    for separator in (",", ";", "\t", r"\s+"):
+    # Polysun, SimStadt and ordinary CSV/TSV files.  Detect the delimiter
+    # from the header instead of accepting the first separator that happens
+    # to create multiple columns.  This matters especially for European
+    # semicolon files with decimal commas: parsing those with sep="," can
+    # create many bogus text columns and previously led to "0 numeric columns".
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        sample_lines = []
+        for line in handle:
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            sample_lines.append(line)
+            if len(sample_lines) >= 8:
+                break
+    sample = "".join(sample_lines)
+
+    separators = []
+    if sample:
         try:
-            frame = pd.read_csv(path, sep=separator, comment="#", engine="python")
-            if len(frame.columns) > 1:
-                return frame
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            separators.append(dialect.delimiter)
+        except csv.Error:
+            first = sample_lines[0] if sample_lines else ""
+            counts = {sep: first.count(sep) for sep in (",", ";", "\t")}
+            guessed = max(counts, key=counts.get)
+            if counts[guessed] > 0:
+                separators.append(guessed)
+
+    for separator in (",", ";", "\t"):
+        if separator not in separators:
+            separators.append(separator)
+
+    best_frame = None
+    best_score = (-1, -1)
+    for separator in separators:
+        try:
+            decimal = "," if separator == ";" else "."
+            frame = pd.read_csv(
+                path,
+                sep=separator,
+                decimal=decimal,
+                comment="#",
+                engine="python",
+                encoding="utf-8-sig",
+            )
+            if len(frame.columns) <= 1:
+                continue
+            promoted = _promote_numeric_columns(frame)
+            n_numeric = len(promoted.select_dtypes(include=[np.number]).columns)
+            # Prefer parses with useful numeric weather columns, then more
+            # columns.  This rejects the classic decimal-comma misparse.
+            score = (n_numeric, len(promoted.columns))
+            if score > best_score:
+                best_frame = promoted
+                best_score = score
         except Exception:
             continue
 
-    return pd.read_csv(path)
+    if best_frame is not None:
+        return best_frame
+
+    return _promote_numeric_columns(pd.read_csv(path))
 
 
 def _column_lookup(frame: pd.DataFrame) -> dict[str, str]:
     return {str(column).strip().lower(): column for column in frame.columns}
+
+
+_NON_NUMERIC_COLUMN_NAMES = {
+    "date",
+    "time",
+    "datetime",
+    "timestamp",
+    "date/time",
+    "date_time",
+    "date (mm/dd/yyyy)",
+    "time (hh:mm)",
+    "flags",
+}
+
+
+def _promote_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert number-like text columns to numeric values.
+
+    Some TMY3/SimStadt files are read by pandas with every column typed as
+    ``object`` even though the weather columns contain numbers.  This helper
+    promotes such columns while deliberately leaving date/time columns alone.
+    Both decimal points and decimal commas are supported.
+    """
+    frame = frame.copy()
+
+    for column in frame.columns:
+        key = str(column).strip().lower()
+        if key in _NON_NUMERIC_COLUMN_NAMES:
+            continue
+        if pd.api.types.is_numeric_dtype(frame[column]):
+            continue
+
+        values = frame[column].astype("string").str.strip()
+        nonempty = values.notna() & ~values.str.lower().isin(
+            {"", "nan", "none", "null", "na", "n/a", "-"}
+        )
+        if not nonempty.any():
+            continue
+
+        cleaned = values.str.replace("\u2212", "-", regex=False)
+        # Decimal commas are common in European CSV-like exports.  Only
+        # translate commas when this cannot be confused with a thousands
+        # separator containing decimal points as well.
+        comma_mask = cleaned.str.contains(",", regex=False, na=False)
+        dot_mask = cleaned.str.contains(".", regex=False, na=False)
+        if comma_mask.any() and not dot_mask.any():
+            cleaned = cleaned.str.replace(",", ".", regex=False)
+
+        parsed = pd.to_numeric(cleaned, errors="coerce")
+        coverage = parsed[nonempty].notna().mean()
+        if coverage >= 0.80:
+            frame[column] = parsed
+
+    return frame
 
 
 def _time_index(frame: pd.DataFrame) -> pd.DatetimeIndex | None:
@@ -208,14 +385,39 @@ def _time_index(frame: pd.DataFrame) -> pd.DatetimeIndex | None:
         date_col = lookup.get(date_key)
         time_col = lookup.get(time_key)
         if date_col is not None and time_col is not None:
-            combined = (
-                frame[date_col].astype(str).str.strip()
-                + " "
-                + frame[time_col].astype(str).str.strip()
+            date_values = pd.to_datetime(
+                frame[date_col].astype(str).str.strip(),
+                errors="coerce",
+                dayfirst=dayfirst,
             )
-            index = pd.DatetimeIndex(
-                pd.to_datetime(combined, errors="coerce", dayfirst=dayfirst)
-            )
+            time_values = frame[time_col].astype(str).str.strip()
+
+            # TMY3 commonly uses 01:00 ... 24:00.  pandas cannot directly
+            # parse 24:00 as a clock time, so construct the offset manually.
+            parts = time_values.str.extract(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
+            hours = pd.to_numeric(parts[0], errors="coerce")
+            minutes = pd.to_numeric(parts[1], errors="coerce").fillna(0)
+            seconds = pd.to_numeric(parts[2], errors="coerce").fillna(0)
+            valid_clock = hours.between(0, 24, inclusive="both") & minutes.between(0, 59, inclusive="both")
+            if valid_clock.mean() >= 0.8:
+                day_add = hours.eq(24).astype(int)
+                normalized_hours = hours.where(~hours.eq(24), 0)
+                index = pd.DatetimeIndex(
+                    date_values
+                    + pd.to_timedelta(day_add, unit="D")
+                    + pd.to_timedelta(normalized_hours, unit="h")
+                    + pd.to_timedelta(minutes, unit="m")
+                    + pd.to_timedelta(seconds, unit="s")
+                )
+            else:
+                combined = (
+                    frame[date_col].astype(str).str.strip()
+                    + " "
+                    + time_values
+                )
+                index = pd.DatetimeIndex(
+                    pd.to_datetime(combined, errors="coerce", dayfirst=dayfirst)
+                )
             if index.notna().any():
                 return index
 
@@ -283,7 +485,8 @@ def _time_index(frame: pd.DataFrame) -> pd.DatetimeIndex | None:
 
 
 def numeric_columns(frame: pd.DataFrame) -> list[str]:
-    return list(frame.select_dtypes(include=[np.number]).columns)
+    promoted = _promote_numeric_columns(frame)
+    return list(promoted.select_dtypes(include=[np.number]).columns)
 
 
 def visualize_weather_file(weather_file, columns=None, max_rows=8760):
@@ -375,6 +578,7 @@ class WeatherFileVisualization:
                 self.weather_file = Path(source)
                 self.path.value = str(source)
 
+            frame = _promote_numeric_columns(frame)
             self.frame = frame
             columns = numeric_columns(frame)
             preferred = [
