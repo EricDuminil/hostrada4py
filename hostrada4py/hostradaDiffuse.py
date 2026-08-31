@@ -83,7 +83,11 @@ class HostradaDiffuse:
         out["solar_zenith"] = zenith
         out["dhi"] = np.nan_to_num(dhi, nan=0.0, posinf=0.0, neginf=0.0)
         out["dni"] = np.nan_to_num(dni, nan=0.0, posinf=0.0, neginf=0.0)
-        out["kd"] = np.where(ghi.to_numpy() > 0, out["dhi"].to_numpy() / ghi.to_numpy(), 0.0)
+        ghi_np = ghi.to_numpy(dtype=float)
+        dhi_np = out["dhi"].to_numpy(dtype=float)
+        kdh = np.zeros_like(ghi_np, dtype=float)
+        np.divide(dhi_np,ghi_np,out=kdh,where=ghi_np > 0)
+        out["kdh"] = kdh
         out["kt"] = kt
         return out
 
