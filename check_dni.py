@@ -89,8 +89,7 @@ def _(LATITUDE, LONGITUDE, YEAR, df, pd, plt, sns):
         #vmax=1000,
     )
     ax.invert_yaxis()
-    plt.title(f"DNI at {LATITUDE}°N {LONGITUDE}°E in {YEAR}\nNote: Too high and too late with current code")
-    plt.savefig('incorrect_dni.png')
+    plt.title(f"DNI at {LATITUDE}°N {LONGITUDE}°E in {YEAR}\nNote: Corrected, and well centered on midday")
     ax
     return
 
